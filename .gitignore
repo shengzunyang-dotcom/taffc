@@ -1,1 +1,11 @@
 wandb/
+acc7/
+checkpoint/
+compare_costs/
+data/
+KNN/
+log/
+llmtest/
+show/
+r-case/
+visual_sim/
