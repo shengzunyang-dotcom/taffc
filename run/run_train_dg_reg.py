@@ -1,0 +1,374 @@
+from lib2to3.pgen2 import token
+from PIL import Image
+import torch
+import wandb
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader, BatchSampler
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm, trange
+from global_configs import *
+
+from transformers.models.clip.tokenization_clip import CLIPTokenizer
+import argparse
+from utils.utils import *
+import pickle
+from data.dataset import *
+# import clip
+from torch.nn import CrossEntropyLoss, L1Loss, MSELoss
+from sklearn.metrics import accuracy_score, f1_score
+from transformers.models.bert.tokenization_bert import BertTokenizer
+from transformers.models.electra.tokenization_electra import ElectraTokenizer
+from transformers import AutoTokenizer
+from sklearn.metrics import accuracy_score
+
+# from src.models import *
+# from src.models_v1 import *
+# from src.models_dg import *
+
+from src.models import *
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--cuda_no", type=str, default=os.environ["CUDA_VISIBLE_DEVICES"])
+parser.add_argument("--dataset", type=str, choices=["mosi", "mosei"], default=DATASETS)
+parser.add_argument("--max_seq_length", type=int, default=50)
+parser.add_argument("--train_batch_size", type=int, default=BATCH_SIZE)
+parser.add_argument("--dev_batch_size", type=int, default=128)
+parser.add_argument("--test_batch_size", type=int, default=128)
+parser.add_argument("--n_epochs", type=int, default=EPOCHS)
+parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE)
+parser.add_argument("--gradient_accumulation_step", type=int, default=1)
+parser.add_argument("--warmup_proportion", type=float, default=0.1)
+parser.add_argument("--seed", type=seed, default="random")
+parser.add_argument("--best_acc", type=float, default=0.1)
+parser.add_argument("--wandb_name", type=str, default='none')
+parser.add_argument("--domain_type", type=int, default=1)
+parser.add_argument("--freeze", type=str, default='freeze')
+parser.add_argument("--unimodal", type=str, default='text')
+parser.add_argument("--layer", type=int, default=1)
+
+parser.add_argument("--warm_up", type=int, default=5)
+
+parser.add_argument("--test", type=int, default=0)
+
+
+parser.add_argument("--t_dim", type=int, default=768)
+parser.add_argument("--v_dim", type=int, default=512)
+parser.add_argument("--a_dim", type=int, default=1024)
+
+parser.add_argument("--dg_label_dim", type=int, default=1)
+parser.add_argument("--ds_label_dim", type=int, default=1)
+
+parser.add_argument("--dsbert", type=str, default='bert')
+parser.add_argument("--dgbert", type=str, default='bert')
+parser.add_argument("--checkpoint_dir", type=str, default='checkpoint-bert')
+
+
+args = parser.parse_args()
+
+def convert_models_to_fp32(model): 
+    for p in model.parameters(): 
+        p.data = p.data.float() 
+        p.grad.data = p.grad.data.float() 
+
+def get_loss_func():
+    dg_loss_fct = CrossEntropyLoss()
+    if args.domain_type == 1 or args.domain_type == 2:
+        ds_loss_fct = MSELoss()
+    else:
+        ds_loss_fct = CrossEntropyLoss()
+    return dg_loss_fct, ds_loss_fct
+
+def prepare_training(train_dataloader):
+    model = DomainGeneralModel(args)
+
+
+    model.to(DEVICE)
+    # optimizer = optim.Adam(model.parameters(), lr=5e-5, betas=(0.9, 0.98), eps=1e-6, weight_decay=0.2)
+
+    param_optimizer = list(model.named_parameters())
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.01,
+        },
+        {
+            "params": [
+                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, len(train_dataloader)*EPOCHS)
+    return model, optimizer, scheduler
+
+def compute_accurracy(preds, y_test, use_zero=False):
+    preds = np.array(preds)
+    y_test = np.array(y_test)
+
+    test_preds_a7 = np.clip(preds, a_min=-3., a_max=3.)
+    test_truth_a7 = np.clip(y_test, a_min=-3., a_max=3.)
+    test_preds_a5 = np.clip(preds, a_min=-2., a_max=2.)
+    test_truth_a5 = np.clip(y_test, a_min=-2., a_max=2.)
+    acc7 = multiclass_acc(test_preds_a7, test_truth_a7)
+    acc5 = multiclass_acc(test_preds_a5, test_truth_a5)
+
+    non_zeros = np.array([i for i, e in enumerate(y_test) if e != 0 or use_zero])
+    preds = preds[non_zeros]
+    y_test = y_test[non_zeros]
+    mae = np.mean(np.absolute(preds - y_test))
+    corr = np.corrcoef(preds, y_test)[0][1]
+    preds = preds >= 0
+    y_test = y_test >= 0
+    f_score = f1_score(y_test, preds, average="weighted")
+    acc = accuracy_score(y_test, preds)
+    return acc, mae, corr, f_score, acc5, acc7
+
+
+def train_epoch(model, train_dataloader, optimizer, scheduler, epoch):
+    step = 0
+    tr_loss = 0
+    model.train()
+    for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
+        sentence, input_ids, attention_mask, visual, visual_len, visual_mask, audio, audio_len, audio_mask, source_label, label_id, segment = batch
+        input_ids, attention_mask, visual, visual_mask, audio, audio_mask, source_label, label_id = input_ids.to(DEVICE), attention_mask.to(DEVICE), visual.to(DEVICE), visual_mask.to(DEVICE), audio.to(DEVICE), audio_mask.to(DEVICE), source_label.to(DEVICE), label_id.to(DEVICE)
+        # src_label = source_label.long()
+        # label_id = label_id.long()
+        step += 1
+        optimizer.zero_grad()
+        outputs = model(input_ids, attention_mask, visual, visual_len, visual_mask, audio, audio_len, audio_mask, label_id, epoch)
+
+        dg_loss_fct, ds_loss_fct = get_loss_func()        
+
+        (text_logits, visual_logits, audio_logits) = outputs
+        text_loss = ds_loss_fct(text_logits.view(-1), label_id.view(-1))
+        visual_loss = ds_loss_fct(visual_logits.view(-1), label_id.view(-1))
+        audio_loss = ds_loss_fct(audio_logits.view(-1), label_id.view(-1))
+
+        total_loss = text_loss + audio_loss + visual_loss
+
+        total_loss.backward()
+        tr_loss += total_loss.item()
+        optimizer.step()
+        scheduler.step()
+
+    tr_loss /= step
+    return tr_loss
+
+def eval_epoch(model, dev_dataloader, optimizer, domain=0, epoch=0, test=False):
+    model.eval()
+    if test == False:
+        text_save_path = f'./{args.checkpoint_dir}/{epoch}-text_domain_general.pth'
+        visual_save_path = f'./{args.checkpoint_dir}/{epoch}-visual_domain_general.pth'
+        audio_save_path = f'./{args.checkpoint_dir}/{epoch}-audio_domain_general.pth'
+
+    torch.save(model.tdg_encoder.state_dict(), text_save_path)
+    torch.save(model.vdg_encoder.state_dict(), visual_save_path)
+    torch.save(model.adg_encoder.state_dict(), audio_save_path)
+
+    # model = DomainGeneralModel(args)
+    # state_dict = torch.load(save_path)
+    # model.load_state_dict(state_dict)
+    # model.to(DEVICE)
+    # model.eval()
+
+    step = 0
+    dev_loss = 0
+    y_test = []
+    text_preds = []
+    visual_preds = []
+    audio_preds = []
+    labels = []
+    with torch.no_grad():
+        for step, batch in enumerate(tqdm(dev_dataloader, desc="Iteration")):
+            sentence, input_ids, attention_mask, visual, visual_len, visual_mask, audio, audio_len, audio_mask, source_label, label_id, segment = batch
+            input_ids, attention_mask, visual, visual_mask, audio, audio_mask, source_label, label_id = input_ids.to(DEVICE), attention_mask.to(DEVICE), visual.to(DEVICE), visual_mask.to(DEVICE), audio.to(DEVICE), audio_mask.to(DEVICE), source_label.to(DEVICE), label_id.to(DEVICE)
+            # source_label = source_label.long()
+            # label_id = label_id.long()
+            outputs = model(input_ids, attention_mask, visual, visual_len, visual_mask, audio, audio_len, audio_mask, label_id, epoch)
+            dg_loss_fct, ds_loss_fct = get_loss_func()
+
+            (text_logits, visual_logits, audio_logits) = outputs
+            text_loss = ds_loss_fct(text_logits.view(-1), label_id.view(-1))
+            visual_loss = ds_loss_fct(visual_logits.view(-1), label_id.view(-1))
+            audio_loss = ds_loss_fct(audio_logits.view(-1), label_id.view(-1))
+
+
+            text_logits = text_logits.detach().cpu().numpy()
+            text_logits = np.squeeze(text_logits).tolist()
+            text_preds.extend(text_logits)
+            
+            visual_logits = visual_logits.detach().cpu().numpy()
+            visual_logits = np.squeeze(visual_logits).tolist()
+            visual_preds.extend(visual_logits)
+
+            audio_logits = audio_logits.detach().cpu().numpy()
+            audio_logits = np.squeeze(audio_logits).tolist()
+            audio_preds.extend(audio_logits)
+
+            label_ids = label_id.detach().cpu().numpy()
+            label_ids = np.squeeze(label_ids).tolist()
+            labels.extend(label_ids)
+
+        text_preds = np.array(text_preds)
+        visual_preds = np.array(visual_preds)
+        audio_preds = np.array(audio_preds)
+        
+        labels = np.array(labels)
+        text_acc, _, _, _, _, _ = compute_accurracy(text_preds, labels)
+        visual_acc, _, _, _, _, _ = compute_accurracy(visual_preds, labels)
+        audio_acc, _, _, _, _, _ = compute_accurracy(audio_preds, labels)
+        
+        return dev_loss, text_acc, visual_acc, audio_acc
+
+
+
+
+def get_dataset():
+    if args.dsbert == 'bert':
+        tokenizer = AutoTokenizer.from_pretrained(BERT_PRETRAIN_PATH)
+    elif args.dsbert == 'electra':
+        tokenizer = AutoTokenizer.from_pretrained(ELECTRA_PRETRAIN_PATH)
+
+    mosi_path = 'merge/mosi_vgg_hubert.pkl'
+    mosei_path = 'merge/mosei_vgg_hubert.pkl'
+    meld_path = 'merge/meld_vgg_hubert.pkl'
+
+    mosi_data_path = os.path.join(PATH, mosi_path)
+    mosei_data_path = os.path.join(PATH, mosei_path)
+    meld_data_path = os.path.join(PATH, meld_path)
+
+    with open(mosi_data_path, "rb") as handle:
+        mosi_data = pickle.load(handle)
+
+    with open(mosei_data_path, "rb") as handle:
+        mosei_data = pickle.load(handle)
+
+    with open(meld_data_path, "rb") as handle:
+        meld_data = pickle.load(handle)
+
+
+
+    # train_dataset = mosi_data['train']
+    # dev_dataset = mosi_data['dev']
+    # test_dataset = mosi_data['test']
+
+    # train_dataset = meld_data['train']
+    # dev_dataset = meld_data['dev']
+    # test_dataset = meld_data['test']
+
+    train_dataset = mosi_data['train'] + mosei_data['train'] + meld_data['train']
+    dev_dataset = mosi_data['dev'] + mosei_data['dev'] + meld_data['dev']
+    test_dataset = mosi_data['test'] + mosei_data['test'] + meld_data['test']
+
+
+    train_data = MultimodalDGDataset(train_dataset, tokenizer)
+    dev_data = MultimodalDGDataset(dev_dataset, tokenizer)
+    test_data = MultimodalDGDataset(test_dataset, tokenizer)
+
+
+    return train_data, dev_data, test_data
+
+
+
+
+def get_dataloader(
+        train_data, 
+        dev_data, 
+        test_data, 
+        ):
+    train_dataloader = DataLoader(train_data, shuffle=True, batch_size=BATCH_SIZE, collate_fn=padding_collate_fn)
+    dev_dataloader = DataLoader(dev_data, shuffle=False, batch_size=BATCH_SIZE, collate_fn=padding_collate_fn)
+    test_dataloader = DataLoader(test_data, shuffle=False, batch_size=BATCH_SIZE, collate_fn=padding_collate_fn)
+    num_train_optimization_steps = 0
+    return train_dataloader, dev_dataloader, test_dataloader
+
+def train(
+    model,
+    train_dataloader,
+    dev_dataloader,
+    test_dataloader,
+    optimizer,
+    scheduler,
+):
+    valid_losses, test_losses = [], []
+    valid_text_best_accs, valid_visual_best_accs, valid_audio_best_accs = [], [], []
+    test_text_best_accs, test_visual_best_accs, test_audio_best_accs = [], [], []
+
+    for epoch in range(int(args.n_epochs)):
+        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler, epoch)
+        valid_loss, valid_text_acc, valid_visual_acc, valid_audio_acc = eval_epoch(model, dev_dataloader, optimizer, epoch=epoch)
+        test_loss, test_text_acc, test_visual_acc, test_audio_acc = eval_epoch(model, test_dataloader, optimizer, epoch=epoch)
+    
+
+        print(
+            f"epoch:{epoch}, train_loss:{train_loss}, valid_loss:{valid_loss}, valid_text_acc:{valid_text_acc},valid_visual_acc:{valid_visual_acc}, valid_audio_acc:{valid_audio_acc}, test_text_acc:{test_text_acc} text_visual_acc:{test_visual_acc}, test_audio_acc:{test_audio_acc}"
+        )
+        valid_losses.append(valid_loss)
+
+        valid_text_best_accs.append(valid_text_acc)
+        valid_visual_best_accs.append(valid_visual_acc)
+        valid_audio_best_accs.append(valid_audio_acc)
+
+
+        test_text_best_accs.append(test_text_acc)
+        test_visual_best_accs.append(test_visual_acc)
+        test_audio_best_accs.append(test_audio_acc)
+
+
+        wandb.log(
+            (
+                {
+                    "train_loss": train_loss,
+                    "best_valid_loss": min(valid_losses),
+                    "valid_loss": valid_loss,
+
+                    'valid_text_acc': valid_text_acc,
+                    "valid_visual_acc": valid_visual_acc,
+                    "valid_audio_acc": valid_audio_acc,
+                    'valid_text_best_acc': max(valid_text_best_accs),
+                    "valid_visual_best_acc": max(valid_visual_best_accs),
+                    "valid_audio_best_acc": max(valid_audio_best_accs),
+
+                    'text_text_acc': test_text_acc,
+                    "test_visual_acc": test_visual_acc,
+                    "test_audio_acc": test_audio_acc,
+                    'test_text_best_acc': max(test_text_best_accs),
+                    "test_visual_best_acc": max(test_visual_best_accs),
+                    "test_audio_best_acc": max(test_audio_best_accs),
+    
+                }
+            )
+        )
+
+
+
+def main():
+    wandb.init(project="Pretrained-DG", name=args.wandb_name)
+    wandb.config.update(args)
+    args.seed = 3407
+    set_random_seed(args.seed)
+    # full setting
+    train_data, dev_data, test_data = get_dataset()
+    train_dataloader, dev_dataloader, test_dataloader = get_dataloader(train_data, dev_data, test_data)
+    model, optimizer, scheduler = prepare_training(train_dataloader)
+    train(
+        model=model,
+        train_dataloader=train_dataloader,
+        dev_dataloader=dev_dataloader,
+        test_dataloader=test_dataloader,
+        optimizer=optimizer,
+        scheduler=scheduler
+        )
+
+
+
+if __name__ == "__main__":
+    main()
+
+

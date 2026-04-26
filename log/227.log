@@ -1,0 +1,44 @@
+wandb: Currently logged in as: zhaoxianbing (use `wandb login --relogin` to force relogin)
+wandb: wandb version 0.16.2 is available!  To upgrade, please run:
+wandb:  $ pip install wandb --upgrade
+wandb: Tracking run with wandb version 0.11.0
+wandb: Syncing run mosi-a100-t-227
+wandb: ⭐️ View project at http://10.249.40.160:8080/zhaoxianbing/knowledge-injection-bert
+wandb: 🚀 View run at http://10.249.40.160:8080/zhaoxianbing/knowledge-injection-bert/runs/3mmv7rg7
+wandb: Run data is saved locally in /home/zhaoxianbing/knowledge-injection/wandb/run-20240116_123922-3mmv7rg7
+wandb: Run `wandb offline` to turn off syncing.
+Some weights of the model checkpoint at /data/CMU/pretrain/bert-base-uncased were not used when initializing BertModel: ['cls.seq_relationship.bias', 'cls.seq_relationship.weight', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.transform.dense.bias', 'cls.predictions.bias', 'cls.predictions.transform.dense.weight', 'cls.predictions.decoder.weight', 'cls.predictions.transform.LayerNorm.weight']
+- This IS expected if you are initializing BertModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing BertModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+
+Seed: 1701
+Iteration:   0% 0/81 [00:00<?, ?it/s]Iteration:   0% 0/81 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "run_knowledge_unimodal.py", line 357, in <module>
+    main()
+  File "run_knowledge_unimodal.py", line 351, in main
+    scheduler=scheduler
+  File "run_knowledge_unimodal.py", line 299, in train
+    train_loss = train_epoch(model, train_dataloader, optimizer, scheduler, epoch)
+  File "run_knowledge_unimodal.py", line 158, in train_epoch
+    outputs = model(input_ids, attention_mask, visual, visual_len, visual_mask, audio, audio_len, audio_mask, label_id, epoch)
+  File "/data/zhaoxianbing/miniconda3/envs/b1-env/lib/python3.7/site-packages/torch/nn/modules/module.py", line 1194, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/zhaoxianbing/knowledge-injection/src/model_uni.py", line 30, in forward
+    text_embeddings = self.bert_encoder(input_ids, attention_mask)
+  File "/data/zhaoxianbing/miniconda3/envs/b1-env/lib/python3.7/site-packages/torch/nn/modules/module.py", line 1194, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/zhaoxianbing/knowledge-injection/pretrained/modeling_bert.py", line 970, in forward
+    self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+  File "/data/zhaoxianbing/miniconda3/envs/b1-env/lib/python3.7/site-packages/torch/nn/modules/module.py", line 1270, in __getattr__
+    type(self).__name__, name))
+AttributeError: 'BertModel' object has no attribute 'warn_if_padding_and_no_attention_mask'
+wandb: Waiting for W&B process to finish, PID 591371
+wandb: Program failed with code 1.  Press ctrl-c to abort syncing.
+wandb: - 0.00MB of 0.00MB uploaded (0.00MB deduped)wandb: \ 0.00MB of 0.00MB uploaded (0.00MB deduped)wandb: | 0.00MB of 0.01MB uploaded (0.00MB deduped)wandb: / 0.01MB of 0.01MB uploaded (0.00MB deduped)wandb: - 0.01MB of 0.01MB uploaded (0.00MB deduped)wandb: \ 0.01MB of 0.01MB uploaded (0.00MB deduped)wandb:                                                                                
+wandb: Find user logs for this run at: /home/zhaoxianbing/knowledge-injection/wandb/run-20240116_123922-3mmv7rg7/logs/debug.log
+wandb: Find internal logs for this run at: /home/zhaoxianbing/knowledge-injection/wandb/run-20240116_123922-3mmv7rg7/logs/debug-internal.log
+wandb: Synced 6 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: 
+wandb: Synced mosi-a100-t-227: http://10.249.40.160:8080/zhaoxianbing/knowledge-injection-bert/runs/3mmv7rg7
+
